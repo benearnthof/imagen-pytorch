@@ -12,6 +12,7 @@ from torch import nn, einsum
 from torch.cuda.amp import autocast
 from torch.nn.parallel import DistributedDataParallel
 import torchvision.transforms as T
+import torchvision
 
 import kornia.augmentation as K
 
@@ -74,6 +75,33 @@ Hparams = namedtuple('Hparams', Hparams_fields)
 def log(t, eps = 1e-20):
     return torch.log(t.clamp(min = eps))
 
+class StyleEncoder(nn.Module):
+    """
+    Hardcoded Module that transforms embeddings from 256x32x32x32 to 1x1024
+    """
+    def __init__(self):
+        super().__init__()
+        self.conv1 = self._make_conv_layer(256, 128)
+        self.conv2 = self._make_conv_layer(128, 64)
+        self.conv3 = self._make_conv_layer(64, 32)
+        self.fc = nn.Linear(2048, 1024, bias=True)
+    
+    def _make_conv_layer(self, in_c, out_c):
+        conv_layer = nn.Sequential(
+            nn.Conv3d(in_c, out_c, kernel_size=(3, 3, 3), padding=1),
+            nn.LeakyReLU(),
+            nn.MaxPool3d((2, 2, 2)),
+        )
+        return conv_layer
+        
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = self.conv3(out)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
+
 # main class
 
 class ElucidatedImagen(nn.Module):
@@ -109,6 +137,7 @@ class ElucidatedImagen(nn.Module):
         S_tmin = 0.05,
         S_tmax = 50,
         S_noise = 1.003,
+        use_style = False,
     ):
         super().__init__()
 
@@ -238,6 +267,9 @@ class ElucidatedImagen(nn.Module):
         # one temp parameter for keeping track of device
 
         self.register_buffer('_temp', torch.tensor([0.]), persistent = False)
+
+        if use_style:
+            self.style_encoder = StyleEncoder() # TODO: clean this up
 
         # default to device of unets passed in
 
@@ -549,6 +581,7 @@ class ElucidatedImagen(nn.Module):
         text_masks = None,
         text_embeds = None,
         cond_images = None,
+        style_embeddings = None,
         cond_video_frames = None,
         post_cond_video_frames = None,
         inpaint_images = None,
@@ -603,6 +636,17 @@ class ElucidatedImagen(nn.Module):
 
         assert not (exists(inpaint_images) ^ exists(inpaint_masks)),  'inpaint images and masks must be both passed in to do inpainting'
 
+        if style_embeddings is not None:
+            style_embed = self.style_encoder(style_embeddings)
+            style_embed = torch.reshape(style_embed, (style_embed.shape[0], 1, style_embed.shape[-1]))
+            if not self.unconditional:
+                text_embeds = torch.cat((text_embeds, style_embed), dim=1)
+                text_masks = torch.cat((text_masks, torch.ones((text_masks.shape[0], 1), dtype=torch.bool).to(self.device)), dim=1)
+            else:
+                text_embeds = style_embed
+                text_masks = torch.ones((text_embeds.shape[0], 1), dtype=torch.bool).to(self.device)
+                
+        
         outputs = []
 
         is_cuda = next(self.parameters()).is_cuda
@@ -744,6 +788,7 @@ class ElucidatedImagen(nn.Module):
     def forward(
         self,
         images, # rename to images or video
+        styles = None,
         unet: Union[Unet, Unet3D, NullUnet, DistributedDataParallel] = None,
         texts: List[str] = None,
         text_embeds = None,
@@ -808,7 +853,15 @@ class ElucidatedImagen(nn.Module):
         assert not (not self.condition_on_text and exists(text_embeds)), 'decoder specified not to be conditioned on text, yet it is presented'
 
         assert not (exists(text_embeds) and text_embeds.shape[-1] != self.text_embed_dim), f'invalid text embedding dimension being passed in (should be {self.text_embed_dim})'
-
+        if style_embeddings is not None:
+            style_embed = self.style_encoder(style_embeddings)
+            style_embed = torch.reshape(style_embed, (style_embed.shape[0], 1, style_embed.shape[-1]))
+            if not self.unconditional:
+                text_embeds = torch.cat((text_embeds, style_embed), dim=1)
+                text_masks = torch.cat((text_masks, torch.ones((text_masks.shape[0], 1), dtype=torch.bool).to(self.device)), dim=1)
+            else:
+                text_embeds = style_embed
+                text_masks = torch.ones((text_embeds.shape[0], 1), dtype=torch.bool).to(self.device)
         # handle video conditioning frames
 
         if self.is_video and self.resize_cond_video_frames:
