@@ -29,6 +29,33 @@ from imagen_pytorch.imagen_video import Unet3D, resize_video_to, scale_video_tim
 
 # helper functions
 
+class StyleEncoder(nn.Module):
+    """
+    Hardcoded Module that transforms embeddings from 256x32x32x32 to 1x1024
+    """
+    def __init__(self):
+        super().__init__()
+        self.conv1 = self._make_conv_layer(256, 128)
+        self.conv2 = self._make_conv_layer(128, 64)
+        self.conv3 = self._make_conv_layer(64, 32)
+        self.fc = nn.Linear(2048, 1024, bias=True)
+    
+    def _make_conv_layer(self, in_c, out_c):
+        conv_layer = nn.Sequential(
+            nn.Conv3d(in_c, out_c, kernel_size=(3, 3, 3), padding=1),
+            nn.LeakyReLU(),
+            nn.MaxPool3d((2, 2, 2)),
+        )
+        return conv_layer
+        
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = self.conv3(out)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
+
 def exists(val):
     return val is not None
 
@@ -1809,6 +1836,7 @@ class Imagen(nn.Module):
         dynamic_thresholding = True,
         dynamic_thresholding_percentile = 0.95,     # unsure what this was based on perusal of paper
         only_train_unet_number = None,
+        use_style = False,
         temporal_downsample_factor = 1,
         resize_cond_video_frames = True,
         resize_mode = 'nearest'
@@ -1968,6 +1996,9 @@ class Imagen(nn.Module):
         # one temp parameter for keeping track of device
 
         self.register_buffer('_temp', torch.tensor([0.]), persistent = False)
+
+        if use_stye:
+            self.style_encoder = StyleEncoder()
 
         # default to device of unets passed in
 
@@ -2286,6 +2317,7 @@ class Imagen(nn.Module):
     @beartype
     def sample(
         self,
+        style_embeddings = None,
         texts: List[str] = None,
         text_masks = None,
         text_embeds = None,
@@ -2342,6 +2374,16 @@ class Imagen(nn.Module):
 
         assert not (exists(inpaint_images) ^ exists(inpaint_masks)),  'inpaint images and masks must be both passed in to do inpainting'
 
+        if style_embeddings is not None:
+            style_embed = self.style_encoder(style_embeddings)
+            style_embed = torch.reshape(style_embed, (style_embed.shape[0], 1, style_embed.shape[-1]))
+            if not self.unconditional:
+                text_embeds = torch.cat((text_embeds, style_embed), dim=1)
+                text_masks = torch.cat((text_masks, torch.ones((text_masks.shape[0], 1), dtype=torch.bool).to(self.device)), dim=1)
+            else:
+                text_embeds = style_embed
+                text_masks = torch.ones((text_embeds.shape[0], 1), dtype=torch.bool).to(self.device)        
+        
         outputs = []
 
         is_cuda = next(self.parameters()).is_cuda
@@ -2624,6 +2666,7 @@ class Imagen(nn.Module):
         self,
         images, # rename to images or video
         unet: Union[Unet, Unet3D, NullUnet, DistributedDataParallel] = None,
+        style_embeddings = None,
         texts: List[str] = None,
         text_embeds = None,
         text_masks = None,
@@ -2690,6 +2733,16 @@ class Imagen(nn.Module):
 
         assert not (exists(text_embeds) and text_embeds.shape[-1] != self.text_embed_dim), f'invalid text embedding dimension being passed in (should be {self.text_embed_dim})'
 
+        if style_embeddings is not None:
+            style_embed = self.style_encoder(style_embeddings)
+            style_embed = torch.reshape(style_embed, (style_embed.shape[0], 1, style_embed.shape[-1]))
+            if not self.unconditional:
+                text_embeds = torch.cat((text_embeds, style_embed), dim=1)
+                text_masks = torch.cat((text_masks, torch.ones((text_masks.shape[0], 1), dtype=torch.bool).to(self.device)), dim=1)
+            else:
+                text_embeds = style_embed
+                text_masks = torch.ones((text_embeds.shape[0], 1), dtype=torch.bool).to(self.device)
+        
         # handle video frame conditioning
 
         if self.is_video and self.resize_cond_video_frames:
